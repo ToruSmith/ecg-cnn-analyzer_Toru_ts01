@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react'
+import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { Play, Square, Download, RefreshCw, Heart, BarChart2, Upload, Settings } from 'lucide-react'
 import ConfigPanel from './components/ConfigPanel'
 import TrainingDashboard from './components/TrainingDashboard'
@@ -7,9 +7,6 @@ import PredictionPanel from './components/PredictionPanel'
 
 const API = import.meta.env.VITE_API_URL || ''
 
-// WS_BASE: 優先用 VITE_WS_URL；若沒設定，從 VITE_API_URL 自動推導
-// https://xxx.onrender.com  →  wss://xxx.onrender.com
-// http://localhost:8000     →  ws://localhost:8000
 function deriveWsBase() {
   if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL
   if (import.meta.env.VITE_API_URL) {
@@ -55,7 +52,6 @@ const s = {
     color: active ? '#00d4ff' : '#64748b',
     display: 'flex', alignItems: 'center', gap: 6,
     transition: 'all 0.15s', background: 'none', border: 'none',
-    borderBottom: active ? '2px solid #00d4ff' : '2px solid transparent',
   }),
   ctrlRow: { display: 'flex', gap: 8, marginTop: 20 },
   badge: (color) => ({
@@ -66,24 +62,115 @@ const s = {
 }
 
 export default function App() {
-  const [config, setConfig] = useState(DEFAULT_CONFIG)
-  const [activeTab, setActiveTab] = useState('train')
-  const [isTraining, setIsTraining] = useState(false)
-  const [jobId, setJobId] = useState(null)
-  const [chartData, setChartData] = useState([])
-  const [logs, setLogs] = useState([])
-  const [modelInfo, setModelInfo] = useState(null)
+  const [config, setConfig]             = useState(DEFAULT_CONFIG)
+  const [activeTab, setActiveTab]       = useState('train')
+  const [isTraining, setIsTraining]     = useState(false)
+  const [jobId, setJobId]               = useState(null)
+  const [chartData, setChartData]       = useState([])
+  const [logs, setLogs]                 = useState([])
+  const [modelInfo, setModelInfo]       = useState(null)
   const [finalMetrics, setFinalMetrics] = useState(null)
-  const [reportMd, setReportMd] = useState('')
-  const wsRef = useRef(null)
+  const [reportMd, setReportMd]         = useState('')
+
+  const wsRef        = useRef(null)
+  const jobIdRef     = useRef(null)
+  const isTrainRef   = useRef(false)
+  const reconnectRef = useRef(null)
+  const doneRef      = useRef(false)
 
   const addLog = useCallback((msg) => {
-    setLogs(prev => [...prev.slice(-80), msg])
+    setLogs(prev => [...prev.slice(-100), msg])
   }, [])
 
+  // ── WebSocket 連線（含自動重連）─────────────────────────────
+  const connectWs = useCallback((job_id) => {
+    if (doneRef.current) return
+    const wsUrl = `${WS_BASE}/api/ws/${job_id}`
+    const ws = new WebSocket(wsUrl)
+    wsRef.current = ws
+
+    ws.onopen = () => {
+      addLog('[INFO] WebSocket 已連線')
+      if (reconnectRef.current) {
+        clearTimeout(reconnectRef.current)
+        reconnectRef.current = null
+      }
+    }
+
+    ws.onmessage = (e) => {
+      let msg
+      try { msg = JSON.parse(e.data) } catch { return }
+      const { event, data, message } = msg
+
+      if (event === 'ping') return
+
+      if (event === 'status') {
+        addLog(`[STATUS] ${message || ''}`)
+      }
+      if (event === 'model_info') {
+        setModelInfo(data)
+        addLog(`[MODEL] 參數量: ${data.param_count?.toLocaleString()} | 裝置: ${data.device}`)
+      }
+      if (event === 'epoch') {
+        setChartData(prev => [...prev, {
+          epoch: data.epoch,
+          train_loss: data.train_loss,
+          val_loss: data.val_loss,
+          accuracy: data.accuracy,
+        }])
+        addLog(
+          `[${String(data.epoch).padStart(3,'0')}/${data.total_epochs}]` +
+          ` loss=${data.train_loss} val=${data.val_loss}` +
+          ` acc=${(data.accuracy * 100).toFixed(1)}% (${data.elapsed_sec}s)`
+        )
+      }
+      if (event === 'done') {
+        doneRef.current = true
+        setFinalMetrics({
+          confusionMatrix: data.confusion_matrix,
+          reportDict: data.classification_report,
+        })
+        setReportMd(data.report_md || '')
+        addLog(`[DONE] ✓ 最終準確率: ${(data.final_accuracy * 100).toFixed(2)}%`)
+        setIsTraining(false)
+        isTrainRef.current = false
+        setActiveTab('metrics')
+      }
+      if (event === 'error') {
+        addLog(`[ERROR] ${message || JSON.stringify(data)}`)
+        setIsTraining(false)
+        isTrainRef.current = false
+      }
+      if (event === 'stopped') {
+        doneRef.current = true
+        addLog('[STOP] 訓練已中止')
+        setIsTraining(false)
+        isTrainRef.current = false
+      }
+    }
+
+    ws.onerror = () => { /* onclose 會處理 */ }
+
+    ws.onclose = (e) => {
+      if (doneRef.current || e.code === 1000 || e.code === 1001) return
+      if (!isTrainRef.current) return
+      // 訓練仍在進行 → 3 秒後重連
+      addLog(`[WS] 連線中斷 (code=${e.code})，3 秒後自動重連...`)
+      reconnectRef.current = setTimeout(() => {
+        if (isTrainRef.current && !doneRef.current) {
+          addLog('[WS] 重新連線中...')
+          connectWs(jobIdRef.current)
+        }
+      }, 3000)
+    }
+  }, [addLog])
+
+  // ── 開始訓練 ──────────────────────────────────────────────
   const startTraining = async () => {
     if (isTraining) return
+    doneRef.current = false
     setIsTraining(true)
+    isTrainRef.current = true
     setChartData([])
     setLogs([])
     setFinalMetrics(null)
@@ -95,100 +182,49 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config),
       })
-      if (!res.ok) {
-        const err = await res.text()
-        throw new Error(`POST /train 失敗 (${res.status}): ${err}`)
-      }
+      if (!res.ok) throw new Error(`POST /train 失敗 (${res.status}): ${await res.text()}`)
+
       const { job_id } = await res.json()
       setJobId(job_id)
+      jobIdRef.current = job_id
       addLog(`[INFO] 訓練任務啟動 job_id=${job_id}`)
-      addLog(`[INFO] 連接 WebSocket: ${WS_BASE}/api/ws/${job_id}`)
-
-      // 連接 WebSocket
-      const wsUrl = `${WS_BASE}/api/ws/${job_id}`
-      const ws = new WebSocket(wsUrl)
-      wsRef.current = ws
-
-      ws.onopen = () => addLog('[INFO] WebSocket 已連線')
-
-      ws.onmessage = (e) => {
-        const msg = JSON.parse(e.data)
-        const { event, data, message } = msg
-
-        if (event === 'ping') return
-
-        if (event === 'status') {
-          addLog(`[STATUS] ${message || JSON.stringify(data)}`)
-        }
-        if (event === 'model_info') {
-          setModelInfo(data)
-          addLog(`[MODEL] 參數量: ${data.param_count?.toLocaleString()} | 裝置: ${data.device}`)
-        }
-        if (event === 'epoch') {
-          setChartData(prev => [...prev, {
-            epoch: data.epoch,
-            train_loss: data.train_loss,
-            val_loss: data.val_loss,
-            accuracy: data.accuracy
-          }])
-          addLog(`[${String(data.epoch).padStart(3,'0')}/${data.total_epochs}] loss=${data.train_loss} val=${data.val_loss} acc=${(data.accuracy*100).toFixed(1)}% (${data.elapsed_sec}s)`)
-        }
-        if (event === 'done') {
-          setFinalMetrics({
-            confusionMatrix: data.confusion_matrix,
-            reportDict: data.classification_report
-          })
-          setReportMd(data.report_md || '')
-          addLog(`[DONE] ✓ 最終準確率: ${(data.final_accuracy * 100).toFixed(2)}%`)
-          setIsTraining(false)
-          setActiveTab('metrics')
-        }
-        if (event === 'error') {
-          addLog(`[ERROR] ${message || JSON.stringify(data)}`)
-          setIsTraining(false)
-        }
-        if (event === 'stopped') {
-          addLog('[STOP] 訓練已中止')
-          setIsTraining(false)
-        }
-      }
-
-      ws.onerror = (e) => {
-        addLog(`[ERROR] WebSocket 連線失敗 — 請確認 VITE_WS_URL 是否設定正確`)
-        addLog(`[DEBUG] 嘗試連線到: ${wsUrl}`)
-        setIsTraining(false)
-      }
-
-      ws.onclose = (e) => {
-        if (e.code !== 1000) addLog(`[WS] 連線關閉 code=${e.code}`)
-      }
-
+      connectWs(job_id)
     } catch (err) {
       addLog(`[ERROR] ${err.message}`)
       setIsTraining(false)
+      isTrainRef.current = false
     }
   }
 
+  // ── 停止訓練 ──────────────────────────────────────────────
   const stopTraining = async () => {
-    if (!jobId) return
-    wsRef.current?.close()
-    await fetch(`${API}/stop/${jobId}`, { method: 'POST' }).catch(() => {})
+    doneRef.current = true
+    isTrainRef.current = false
+    if (reconnectRef.current) clearTimeout(reconnectRef.current)
+    wsRef.current?.close(1000)
+    if (jobIdRef.current) {
+      await fetch(`${API}/stop/${jobIdRef.current}`, { method: 'POST' }).catch(() => {})
+    }
     setIsTraining(false)
   }
+
+  useEffect(() => () => {
+    doneRef.current = true
+    if (reconnectRef.current) clearTimeout(reconnectRef.current)
+    wsRef.current?.close(1000)
+  }, [])
 
   const downloadReport = () => {
     if (!reportMd) return
     const blob = new Blob([reportMd], { type: 'text/markdown' })
-    const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    a.href = url
-    a.download = `ECG_Report_${jobId || 'latest'}.md`
+    a.href = URL.createObjectURL(blob)
+    a.download = `ECG_Report_${jobIdRef.current || 'latest'}.md`
     a.click()
   }
 
   return (
     <div style={s.app}>
-      {/* Header */}
       <header style={s.header}>
         <div style={s.headerLeft}>
           <div style={s.logo}>
@@ -201,7 +237,8 @@ export default function App() {
           {isTraining && <span style={s.badge('0,255,157')}>訓練中</span>}
           {jobId && !isTraining && <span style={s.badge('0,212,255')}>JOB: {jobId}</span>}
           {reportMd && (
-            <button className="btn-secondary" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
+            <button className="btn-secondary"
+              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}
               onClick={downloadReport}>
               <Download size={13} /> 下載 .md 報告
             </button>
@@ -210,7 +247,6 @@ export default function App() {
       </header>
 
       <div style={s.body}>
-        {/* Sidebar — Config */}
         <aside style={s.sidebar}>
           <div style={{ fontSize: 11, color: '#64748b', fontFamily: 'IBM Plex Mono', textTransform: 'uppercase', letterSpacing: 1.5, marginBottom: 16, display: 'flex', alignItems: 'center', gap: 6 }}>
             <Settings size={12} /> 模型設定
@@ -222,37 +258,40 @@ export default function App() {
               <Play size={13} /> {isTraining ? '訓練中...' : '開始訓練'}
             </button>
             {isTraining && (
-              <button className="btn-danger" onClick={stopTraining} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <button className="btn-danger" onClick={stopTraining}
+                style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                 <Square size={12} />
               </button>
             )}
           </div>
           {!isTraining && chartData.length > 0 && (
-            <button className="btn-secondary" onClick={() => { setChartData([]); setLogs([]); setFinalMetrics(null) }}
+            <button className="btn-secondary"
+              onClick={() => { setChartData([]); setLogs([]); setFinalMetrics(null) }}
               style={{ marginTop: 8, width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 12 }}>
               <RefreshCw size={12} /> 重置
             </button>
           )}
         </aside>
 
-        {/* Main content */}
         <main style={s.main}>
           <div style={s.tabBar}>
             {TABS.map(tab => (
-              <button key={tab.id} style={s.tab(activeTab === tab.id)} onClick={() => setActiveTab(tab.id)}>
+              <button key={tab.id} style={s.tab(activeTab === tab.id)}
+                onClick={() => setActiveTab(tab.id)}>
                 {tab.icon} {tab.label}
               </button>
             ))}
           </div>
 
           {activeTab === 'train' && (
-            <TrainingDashboard chartData={chartData} logs={logs} isTraining={isTraining} modelInfo={modelInfo} />
+            <TrainingDashboard
+              chartData={chartData} logs={logs}
+              isTraining={isTraining} modelInfo={modelInfo} />
           )}
           {activeTab === 'metrics' && (
             <MetricsPanel
               confusionMatrix={finalMetrics?.confusionMatrix}
-              reportDict={finalMetrics?.reportDict}
-            />
+              reportDict={finalMetrics?.reportDict} />
           )}
           {activeTab === 'predict' && (
             <PredictionPanel jobId={jobId} />

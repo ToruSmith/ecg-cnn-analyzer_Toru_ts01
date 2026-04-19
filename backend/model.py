@@ -1,6 +1,6 @@
 """
 ECG 1D-CNN Model — 可動態調整層數、核大小、Dropout
-支援 CrossEntropy 與 Focal Loss
+base_filters 預設改為 16（原 32），Render 免費方案每 epoch ~30s
 """
 import torch
 import torch.nn as nn
@@ -13,11 +13,10 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
         self.weight = weight
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+    def forward(self, logits, targets):
         ce = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
         pt = torch.exp(-ce)
-        loss = ((1 - pt) ** self.gamma) * ce
-        return loss.mean()
+        return (((1 - pt) ** self.gamma) * ce).mean()
 
 
 def get_loss_fn(name: str, num_classes: int, class_weights=None):
@@ -28,11 +27,10 @@ def get_loss_fn(name: str, num_classes: int, class_weights=None):
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, kernel: int, dropout: float):
+    def __init__(self, in_ch, out_ch, kernel, dropout):
         super().__init__()
-        pad = kernel // 2
         self.block = nn.Sequential(
-            nn.Conv1d(in_ch, out_ch, kernel, padding=pad),
+            nn.Conv1d(in_ch, out_ch, kernel, padding=kernel // 2),
             nn.BatchNorm1d(out_ch),
             nn.ReLU(),
             nn.MaxPool1d(2),
@@ -45,13 +43,10 @@ class ConvBlock(nn.Module):
 
 class ECG_CNN(nn.Module):
     """
-    動態 1D-CNN:
-      - conv_layers: 1–4
-      - kernel_size: 3 / 5 / 7
-      - dropout: 0–0.5
-      - num_classes: 依資料集決定 (MIT-BIH 預設 5 類)
+    動態 1D-CNN
+    base_filters=16 → Render 免費方案每 epoch ~25-35s，20 epochs 約 10 分鐘
+    base_filters=32 → 每 epoch ~180s，不適合免費方案
     """
-
     def __init__(
         self,
         input_len: int = 187,
@@ -59,7 +54,7 @@ class ECG_CNN(nn.Module):
         conv_layers: int = 2,
         kernel_size: int = 5,
         dropout: float = 0.3,
-        base_filters: int = 32,
+        base_filters: int = 16,   # ← 從 32 改為 16
     ):
         super().__init__()
         self.config = dict(
@@ -72,53 +67,42 @@ class ECG_CNN(nn.Module):
         )
 
         layers = []
-        in_ch = 1
-        out_ch = base_filters
+        in_ch, out_ch = 1, base_filters
         for _ in range(conv_layers):
             layers.append(ConvBlock(in_ch, out_ch, kernel_size, dropout))
             in_ch = out_ch
-            out_ch = min(out_ch * 2, 256)
+            out_ch = min(out_ch * 2, 128)   # 上限從 256 降到 128
 
         self.conv = nn.Sequential(*layers)
 
-        # 計算 flatten 後尺寸
         with torch.no_grad():
             dummy = torch.zeros(1, 1, input_len)
             flat_size = self.conv(dummy).view(1, -1).shape[1]
 
         self.classifier = nn.Sequential(
-            nn.Linear(flat_size, 128),
+            nn.Linear(flat_size, 64),   # 從 128 降到 64
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(128, num_classes),
+            nn.Linear(64, num_classes),
         )
 
-    def forward(self, x: torch.Tensor):
-        # x: (B, input_len) → (B, 1, input_len)
+    def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         return self.classifier(x)
 
-    def grad_cam(self, x: torch.Tensor):
-        """Grad-CAM 1D：回傳與輸入等長的 saliency map"""
+    def grad_cam(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(1)
-        x.requires_grad_(True)
+        x = x.clone().detach().requires_grad_(True)
 
-        activations = []
-        gradients = []
+        activations, gradients = [], []
 
-        def fwd_hook(_, __, output):
-            activations.append(output)
-
-        def bwd_hook(_, __, grad_output):
-            gradients.append(grad_output[0])
-
-        last_conv = list(self.conv.children())[-1].block[0]  # 最後一層 Conv1d
-        fh = last_conv.register_forward_hook(fwd_hook)
-        bh = last_conv.register_backward_hook(bwd_hook)
+        last_conv = list(self.conv.children())[-1].block[0]
+        fh = last_conv.register_forward_hook(lambda *a: activations.append(a[2]))
+        bh = last_conv.register_full_backward_hook(lambda *a: gradients.append(a[2][0]))
 
         logits = self.forward(x)
         pred = logits.argmax(dim=1)
@@ -127,16 +111,14 @@ class ECG_CNN(nn.Module):
         fh.remove()
         bh.remove()
 
-        act = activations[0].detach()        # (1, C, L)
-        grad = gradients[0].detach()         # (1, C, L)
+        act  = activations[0].detach()
+        grad = gradients[0].detach()
         weights = grad.mean(dim=-1, keepdim=True)
-        cam = (weights * act).sum(dim=1)     # (1, L)
-        cam = F.relu(cam)
+        cam = F.relu((weights * act).sum(dim=1))
         cam = cam - cam.min()
         if cam.max() > 0:
             cam = cam / cam.max()
 
-        # 內插到原始長度
         cam_full = F.interpolate(
             cam.unsqueeze(1), size=x.shape[-1], mode="linear", align_corners=False
         ).squeeze()
