@@ -1,12 +1,13 @@
 """
 FastAPI 主程式
 端點:
+  GET  /               → 根路徑（健康確認）
+  GET  /health         → 健康檢查
   POST /train          → 啟動訓練任務，回傳 job_id
   WS   /api/ws/{job}   → 訂閱訓練進度推播
   POST /predict        → CSV 上傳批量預測
   GET  /report/{job}   → 取得 .md 報告
   POST /gradcam        → 單筆 Grad-CAM 分析
-  GET  /health         → 健康檢查
 """
 import asyncio
 import json
@@ -14,50 +15,73 @@ import uuid
 import tempfile
 import os
 from typing import Dict, Optional
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from trainer import Trainer, TrainingConfig
 from data_loader import load_csv_segments
 
-app = FastAPI(title="ECG-CNN Analyzer API", version="1.0.0")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 啟動時預先觸發 matplotlib font cache，避免第一次訓練超時
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        plt.close("all")
+        print("[STARTUP] matplotlib font cache ready")
+    except Exception as e:
+        print(f"[STARTUP] matplotlib pre-warm skipped: {e}")
+    yield
+
+
+app = FastAPI(title="ECG-CNN Analyzer API", version="1.0.0", lifespan=lifespan)
+
+# ─── CORS：允許所有來源（Netlify 部署後可限縮） ─────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生產環境請改為 Netlify URL
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,   # credentials=True 與 origins=["*"] 不相容，改 False
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ─── 狀態管理 ────────────────────────────────────────────────
-jobs: Dict[str, Trainer] = {}          # job_id → Trainer
-ws_queues: Dict[str, asyncio.Queue] = {}  # job_id → Queue
+jobs: Dict[str, Trainer] = {}
+ws_queues: Dict[str, asyncio.Queue] = {}
 
 
 # ─── Schemas ────────────────────────────────────────────────
 class TrainRequest(BaseModel):
-    conv_layers: int = Field(2, ge=1, le=4, description="卷積層數 1-4")
-    kernel_size: int = Field(5, description="核大小 3/5/7")
+    conv_layers: int = Field(2, ge=1, le=4)
+    kernel_size: int = Field(5)
     dropout: float = Field(0.3, ge=0.0, le=0.5)
-    lr: float = Field(1e-3, gt=0, description="學習率")
-    batch_size: int = Field(32, description="16/32/64")
+    lr: float = Field(1e-3, gt=0)
+    batch_size: int = Field(32)
     epochs: int = Field(20, ge=5, le=100)
-    loss_fn: str = Field("CrossEntropy", description="CrossEntropy/FocalLoss")
-    optimizer: str = Field("Adam", description="Adam/SGD/AdamW")
-    data_source: str = Field("synthetic", description="synthetic/mitbih")
+    loss_fn: str = Field("CrossEntropy")
+    optimizer: str = Field("Adam")
+    data_source: str = Field("synthetic")
     n_samples: int = Field(5000, ge=500, le=20000)
 
 
 class GradCAMRequest(BaseModel):
     job_id: str
-    signal: list  # 187 個浮點數
+    signal: list
 
 
 # ─── 路由 ────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    """根路徑：讓瀏覽器和前端確認後端存活"""
+    return {"status": "ok", "service": "ECG-CNN Analyzer API", "version": "1.0.0"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "jobs_active": len(jobs)}
@@ -76,7 +100,6 @@ async def start_training(req: TrainRequest):
     trainer = Trainer(config, push_fn=push_fn)
     jobs[job_id] = trainer
 
-    # 背景執行訓練
     asyncio.create_task(trainer.run())
     return {"job_id": job_id}
 
@@ -95,13 +118,10 @@ async def ws_training(websocket: WebSocket, job_id: str):
             try:
                 msg = await asyncio.wait_for(queue.get(), timeout=60.0)
                 await websocket.send_text(msg)
-
-                # 解析是否已結束
                 parsed = json.loads(msg)
                 if parsed.get("event") in ("done", "error", "stopped"):
                     break
             except asyncio.TimeoutError:
-                # 發送 ping 保持連線
                 await websocket.send_text(json.dumps({"event": "ping"}))
     except WebSocketDisconnect:
         pass
@@ -119,7 +139,7 @@ def stop_training(job_id: str):
 @app.post("/predict")
 async def predict(
     job_id: str,
-    file: UploadFile = File(..., description="CSV 檔案，每行 187 欄 ECG 數值"),
+    file: UploadFile = File(...),
 ):
     trainer = jobs.get(job_id)
     if not trainer or trainer.model is None:
@@ -155,7 +175,7 @@ def grad_cam(req: GradCAMRequest):
 def get_report(job_id: str):
     trainer = jobs.get(job_id)
     if not trainer or not trainer.final_metrics:
-        raise HTTPException(404, "報告尚未生成，請等待訓練完成")
+        raise HTTPException(404, "報告尚未生成")
     return trainer._generate_md_report(trainer.final_metrics)
 
 
@@ -168,3 +188,4 @@ def get_history(job_id: str):
         "history": trainer.history,
         "is_running": trainer.is_running,
     }
+
