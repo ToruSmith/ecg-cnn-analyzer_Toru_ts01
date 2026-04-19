@@ -7,17 +7,6 @@ import PredictionPanel from './components/PredictionPanel'
 
 const API = import.meta.env.VITE_API_URL || ''
 
-function deriveWsBase() {
-  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL
-      .replace(/^https:\/\//, 'wss://')
-      .replace(/^http:\/\//, 'ws://')
-  }
-  return 'ws://localhost:8000'
-}
-const WS_BASE = deriveWsBase()
-
 const DEFAULT_CONFIG = {
   conv_layers: 2, kernel_size: 5, dropout: 0.3,
   lr: 0.001, batch_size: 32, epochs: 20,
@@ -42,16 +31,16 @@ const s = {
   headerLeft: { display: 'flex', alignItems: 'center', gap: 12 },
   logo: { fontFamily: 'IBM Plex Mono', fontSize: 16, fontWeight: 600, color: '#00d4ff', display: 'flex', alignItems: 'center', gap: 8 },
   subtitle: { fontSize: 11, color: '#475569', fontFamily: 'IBM Plex Mono' },
-  body: { display: 'flex', flex: 1, gap: 0 },
+  body: { display: 'flex', flex: 1 },
   sidebar: { width: 280, minWidth: 280, borderRight: '1px solid #1e3a5f', padding: 20, overflowY: 'auto', background: '#0a0e1a' },
   main: { flex: 1, padding: 20, overflowY: 'auto' },
-  tabBar: { display: 'flex', gap: 0, borderBottom: '1px solid #1e3a5f', marginBottom: 20 },
+  tabBar: { display: 'flex', borderBottom: '1px solid #1e3a5f', marginBottom: 20 },
   tab: (active) => ({
     padding: '10px 18px', fontSize: 12, fontFamily: 'IBM Plex Mono', cursor: 'pointer',
     borderBottom: active ? '2px solid #00d4ff' : '2px solid transparent',
     color: active ? '#00d4ff' : '#64748b',
     display: 'flex', alignItems: 'center', gap: 6,
-    transition: 'all 0.15s', background: 'none', border: 'none',
+    background: 'none', border: 'none', transition: 'all 0.15s',
   }),
   ctrlRow: { display: 'flex', gap: 8, marginTop: 20 },
   badge: (color) => ({
@@ -72,109 +61,112 @@ export default function App() {
   const [finalMetrics, setFinalMetrics] = useState(null)
   const [reportMd, setReportMd]         = useState('')
 
-  const wsRef        = useRef(null)
-  const jobIdRef     = useRef(null)
-  const isTrainRef   = useRef(false)
-  const reconnectRef = useRef(null)
-  const doneRef      = useRef(false)
+  const pollRef    = useRef(null)   // setInterval handle
+  const seenRef    = useRef(0)      // 已處理的 event 數量
+  const jobIdRef   = useRef(null)
+  const doneRef    = useRef(false)
 
   const addLog = useCallback((msg) => {
     setLogs(prev => [...prev.slice(-100), msg])
   }, [])
 
-  // ── WebSocket 連線（含自動重連）─────────────────────────────
-  const connectWs = useCallback((job_id) => {
-    if (doneRef.current) return
-    const wsUrl = `${WS_BASE}/api/ws/${job_id}`
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
+  // ── 處理單條 event ─────────────────────────────────────────
+  const handleEvent = useCallback((raw) => {
+    let msg
+    try { msg = JSON.parse(raw) } catch { return }
+    const { event, data, message } = msg
 
-    ws.onopen = () => {
-      addLog('[INFO] WebSocket 已連線')
-      if (reconnectRef.current) {
-        clearTimeout(reconnectRef.current)
-        reconnectRef.current = null
-      }
+    if (event === 'ping') return
+
+    if (event === 'status') {
+      addLog(`[STATUS] ${message || ''}`)
     }
-
-    ws.onmessage = (e) => {
-      let msg
-      try { msg = JSON.parse(e.data) } catch { return }
-      const { event, data, message } = msg
-
-      if (event === 'ping') return
-
-      if (event === 'status') {
-        addLog(`[STATUS] ${message || ''}`)
-      }
-      if (event === 'model_info') {
-        setModelInfo(data)
-        addLog(`[MODEL] 參數量: ${data.param_count?.toLocaleString()} | 裝置: ${data.device}`)
-      }
-      if (event === 'epoch') {
-        setChartData(prev => [...prev, {
-          epoch: data.epoch,
-          train_loss: data.train_loss,
-          val_loss: data.val_loss,
-          accuracy: data.accuracy,
-        }])
-        addLog(
-          `[${String(data.epoch).padStart(3,'0')}/${data.total_epochs}]` +
-          ` loss=${data.train_loss} val=${data.val_loss}` +
-          ` acc=${(data.accuracy * 100).toFixed(1)}% (${data.elapsed_sec}s)`
-        )
-      }
-      if (event === 'done') {
-        doneRef.current = true
-        setFinalMetrics({
-          confusionMatrix: data.confusion_matrix,
-          reportDict: data.classification_report,
-        })
-        setReportMd(data.report_md || '')
-        addLog(`[DONE] ✓ 最終準確率: ${(data.final_accuracy * 100).toFixed(2)}%`)
-        setIsTraining(false)
-        isTrainRef.current = false
-        setActiveTab('metrics')
-      }
-      if (event === 'error') {
-        addLog(`[ERROR] ${message || JSON.stringify(data)}`)
-        setIsTraining(false)
-        isTrainRef.current = false
-      }
-      if (event === 'stopped') {
-        doneRef.current = true
-        addLog('[STOP] 訓練已中止')
-        setIsTraining(false)
-        isTrainRef.current = false
-      }
+    if (event === 'model_info') {
+      setModelInfo(data)
+      addLog(`[MODEL] 參數量: ${data.param_count?.toLocaleString()} | 裝置: ${data.device}`)
     }
-
-    ws.onerror = () => { /* onclose 會處理 */ }
-
-    ws.onclose = (e) => {
-      if (doneRef.current || e.code === 1000 || e.code === 1001) return
-      if (!isTrainRef.current) return
-      // 訓練仍在進行 → 3 秒後重連
-      addLog(`[WS] 連線中斷 (code=${e.code})，3 秒後自動重連...`)
-      reconnectRef.current = setTimeout(() => {
-        if (isTrainRef.current && !doneRef.current) {
-          addLog('[WS] 重新連線中...')
-          connectWs(jobIdRef.current)
-        }
-      }, 3000)
+    if (event === 'epoch') {
+      setChartData(prev => [...prev, {
+        epoch: data.epoch,
+        train_loss: data.train_loss,
+        val_loss: data.val_loss,
+        accuracy: data.accuracy,
+      }])
+      addLog(
+        `[${String(data.epoch).padStart(3,'0')}/${data.total_epochs}]` +
+        ` loss=${data.train_loss} val=${data.val_loss}` +
+        ` acc=${(data.accuracy * 100).toFixed(1)}% (${data.elapsed_sec}s)`
+      )
+    }
+    if (event === 'done') {
+      doneRef.current = true
+      setFinalMetrics({
+        confusionMatrix: data.confusion_matrix,
+        reportDict: data.classification_report,
+      })
+      setReportMd(data.report_md || '')
+      addLog(`[DONE] ✓ 最終準確率: ${(data.final_accuracy * 100).toFixed(2)}%`)
+      setIsTraining(false)
+      setActiveTab('metrics')
+      stopPolling()
+    }
+    if (event === 'error') {
+      addLog(`[ERROR] ${message || JSON.stringify(data)}`)
+      setIsTraining(false)
+      stopPolling()
+    }
+    if (event === 'stopped') {
+      doneRef.current = true
+      addLog('[STOP] 訓練已中止')
+      setIsTraining(false)
+      stopPolling()
     }
   }, [addLog])
+
+  // ── Polling ────────────────────────────────────────────────
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+  }, [])
+
+  const startPolling = useCallback((job_id) => {
+    stopPolling()
+    seenRef.current = 0
+    doneRef.current = false
+
+    pollRef.current = setInterval(async () => {
+      if (doneRef.current) { stopPolling(); return }
+      try {
+        const res = await fetch(`${API}/poll/${job_id}?since=${seenRef.current}`)
+        if (!res.ok) {
+          // 後端重啟了（404）→ 停止輪詢
+          if (res.status === 404) {
+            addLog('[ERROR] 後端重啟，工作已遺失。請重新訓練。')
+            setIsTraining(false)
+            stopPolling()
+          }
+          return
+        }
+        const { events, total } = await res.json()
+        events.forEach(handleEvent)
+        seenRef.current = total
+      } catch (e) {
+        // 網路瞬斷，靜默重試
+      }
+    }, 3000)   // 每 3 秒輪詢一次
+  }, [handleEvent, stopPolling, addLog])
 
   // ── 開始訓練 ──────────────────────────────────────────────
   const startTraining = async () => {
     if (isTraining) return
-    doneRef.current = false
     setIsTraining(true)
-    isTrainRef.current = true
     setChartData([])
     setLogs([])
     setFinalMetrics(null)
     setReportMd('')
+    doneRef.current = false
 
     try {
       const res = await fetch(`${API}/train`, {
@@ -188,31 +180,26 @@ export default function App() {
       setJobId(job_id)
       jobIdRef.current = job_id
       addLog(`[INFO] 訓練任務啟動 job_id=${job_id}`)
-      connectWs(job_id)
+      addLog(`[INFO] 使用 Polling 模式（每 3 秒更新）`)
+      startPolling(job_id)
     } catch (err) {
       addLog(`[ERROR] ${err.message}`)
       setIsTraining(false)
-      isTrainRef.current = false
     }
   }
 
   // ── 停止訓練 ──────────────────────────────────────────────
   const stopTraining = async () => {
     doneRef.current = true
-    isTrainRef.current = false
-    if (reconnectRef.current) clearTimeout(reconnectRef.current)
-    wsRef.current?.close(1000)
+    stopPolling()
     if (jobIdRef.current) {
       await fetch(`${API}/stop/${jobIdRef.current}`, { method: 'POST' }).catch(() => {})
     }
     setIsTraining(false)
+    addLog('[STOP] 已送出停止請求')
   }
 
-  useEffect(() => () => {
-    doneRef.current = true
-    if (reconnectRef.current) clearTimeout(reconnectRef.current)
-    wsRef.current?.close(1000)
-  }, [])
+  useEffect(() => () => stopPolling(), [stopPolling])
 
   const downloadReport = () => {
     if (!reportMd) return
